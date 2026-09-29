@@ -1,0 +1,6 @@
+node_modules/
+.env
+equipo.json
+procesados.json
+*.log
+.DS_Store
