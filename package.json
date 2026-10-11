@@ -1,14 +1,21 @@
 {
   "name": "neto-telegram-bot",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "3.0.0",
+  "description": "Sistema de monitoreo y alertas multi-ingeniero CSN (Soluciones Neto) vía Telegram y NetoBox MCP",
+  "main": "bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js",
+    "check": "node --check bot.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "telegram-bot",
+    "netobox",
+    "zendesk",
+    "mcp",
+    "csn"
+  ],
+  "author": "Soporte Técnico Zona Chiapas",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^18.0.4"
