@@ -449,9 +449,29 @@ async function llamarMCP(pat, toolName, args) {
     data = JSON.parse(rawText);
   }
 
-  if (data?.result?.content?.[0]?.text) {
-    return JSON.parse(data.result.content[0].text);
+  if (data?.error) {
+    throw new Error(data.error.message || JSON.stringify(data.error));
   }
+
+  if (data?.result?.isError) {
+    const errMsg = data.result.content?.map(c => c.text).join(' ') || 'Error de herramienta MCP';
+    throw new Error(errMsg);
+  }
+
+  // NetoBox MCP puede anteponer un bloque de advertencia/descargo en content[0].
+  // Recorremos todos los bloques de contenido y devolvemos el que contenga JSON parseable.
+  if (Array.isArray(data?.result?.content)) {
+    for (const item of data.result.content) {
+      if (item.type === 'text' && item.text) {
+        try {
+          return JSON.parse(item.text);
+        } catch (_) {}
+      }
+    }
+    const firstText = data.result.content.find(c => c.text)?.text;
+    if (firstText) return { text: firstText };
+  }
+
   return data?.result || data;
 }
 
@@ -478,41 +498,61 @@ async function procesarIngeniero(ing, esManual = false) {
   let notificadosEnCiclo = 0;
 
   try {
-    const dataList = await llamarMCP(ing.pat, 'mail_list', { folder: 'all', limit: 15 });
-    const emails = dataList.emails || [];
+    // NetoBox MCP usa folderId: 'INBOX' y retorna hilos
+    const dataList = await llamarMCP(ing.pat, 'mail_list', { folderId: 'INBOX' });
+    const emails = dataList.hilos || dataList.emails || [];
 
     // Invertir lista para orden cronológico (antiguo a reciente)
     const emailsCronologicos = [...emails].reverse();
 
     for (const email of emailsCronologicos) {
-      if (correos.has(email.id)) continue;
+      const emailId = email.id;
+      if (!emailId || correos.has(emailId)) continue;
 
-      const remitente = (email.from || '') + ' ' + (email.fromEmail || '');
+      // Extraer remitente de forma compatible (nuevo formato hilos o anterior emails)
+      let remitente = '';
+      if (Array.isArray(email.remitentes)) {
+        remitente = email.remitentes.map(r => `${r.nombre || ''} ${r.direccion || ''}`).join(' ');
+      } else {
+        remitente = `${email.from || ''} ${email.fromEmail || ''}`;
+      }
+
+      const asunto = email.asunto || email.subject || '';
+      const extracto = email.extracto || email.snippet || '';
+
       const esNeto = remitente.toLowerCase().includes('soluciones neto') || 
                      remitente.toLowerCase().includes('centrodesolucionesneto') ||
-                     remitente.toLowerCase().includes('soyneto');
+                     remitente.toLowerCase().includes('soyneto') ||
+                     asunto.toLowerCase().includes('soluciones neto');
 
       if (esNeto) {
-        let cuerpo = '';
-        let fechaCorreo = email.date;
+        let cuerpo = extracto;
+        let fechaCorreo = email.fecha || email.date;
 
         try {
-          const detalle = await llamarMCP(ing.pat, 'mail_read', { emailId: email.id });
-          cuerpo = detalle.body || detalle.snippet || '';
-          if (detalle.date) fechaCorreo = detalle.date;
+          const detalle = await llamarMCP(ing.pat, 'mail_read', { threadId: emailId });
+          if (detalle?.mensajes && detalle.mensajes.length > 0) {
+            cuerpo = detalle.mensajes[0].texto || cuerpo;
+            if (detalle.mensajes[0].fecha) fechaCorreo = detalle.mensajes[0].fecha;
+          } else if (detalle?.body || detalle?.snippet) {
+            cuerpo = detalle.body || detalle.snippet || cuerpo;
+            if (detalle.date) fechaCorreo = detalle.date;
+          }
         } catch (e) {
-          cuerpo = email.snippet || '';
+          console.warn(`[WARN] No se pudo leer detalle del hilo ${emailId}:`, e.message);
         }
 
-        const textoBusqueda = `${email.subject || ''}\n${cuerpo}`.toLowerCase();
+        const textoBusqueda = `${asunto}\n${cuerpo}`.toLowerCase();
 
         // 1. Extracción y saneamiento de datos
-        const rawFolio = extraerRegex(email.subject + '\n' + cuerpo, /(?:Ticket\s*#?|solicitud\s*\(|#)(\d{4,8})/i, 1, '');
+        const rawFolio = extraerRegex(asunto + '\n' + cuerpo, /(?:Ticket\s*#?|solicitud\s*\(|#)(\d{4,8})/i, 1, '');
         const folio = rawFolio ? `#${rawFolio}` : 'Ver detalles';
-        const tiendaRaw = extraerRegex(cuerpo, /(?:Solicitante|Organización|Tienda)\s*:?\s*([0-9]{3,4}\s*-[^\n\r<]+)/i, 1, 'No especificada');
+        const tiendaRaw = extraerRegex(asunto + '\n' + cuerpo, /(?:Solicitante|Organización|Tienda|Sucursal)\s*:?\s*([0-9]{3,5}\s*-[^\n\r<]+|[0-9]{3,5}\b[^\n\r<]+)/i, 1, '')
+          || extraerRegex(asunto, /\b(?:tienda|sucursal|tda)\.?\s*#?\s*([0-9]{3,5}(?:\s*-[^\n\r]+)?)/i, 1, '')
+          || 'Centro de Soluciones Neto';
         const prioridadRaw = extraerRegex(cuerpo, /Prioridad\s*:?\s*([A-Za-zÁÉÍÓÚáéíóú]+)/i, 1, 'Normal');
         const hora = formatearHoraLocal(fechaCorreo);
-        const fallaLimpia = limpiarAsunto(email.subject);
+        const fallaLimpia = limpiarAsunto(asunto);
 
         const folioHtml = escaparHtml(folio);
         const tiendaHtml = escaparHtml(tiendaRaw);
