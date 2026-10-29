@@ -257,7 +257,51 @@ function formatearHoraLocal(rawDate) {
 }
 
 function extraerNotaComentario(cuerpo) {
-  return extraerRegex(cuerpo, /(?:Nota interna|comentario:?)\s*\n+([^\n\r]+)/i, 1, '');
+  if (!cuerpo) return '';
+  // 1. Nota técnica de resolución
+  const mRes = cuerpo.match(/(?:validado la solución|marcado como resuelto:?)\s*\n+([\s\S]+?)(?:\n\s*-{4,}|\n\s*Este correo|\[[A-Z0-9-]+\]|$)/i);
+  if (mRes) {
+    const nota = mRes[1]
+      .replace(/Favor de marcar el ticket como Resuelto si has validado la solución/gi, '')
+      .replace(/[\r\n]+/g, ' ')
+      .trim();
+    if (nota) return nota.slice(0, 300);
+  }
+  // 2. Nota interna o comentario estándar
+  const mNota = cuerpo.match(/(?:Nota interna|comentario:?)\s*\n+([^\n\r]+)/i);
+  if (mNota) return mNota[1].trim();
+
+  return '';
+}
+
+/**
+ * Extrae de forma inteligente el número y nombre de la tienda del correo.
+ * Soporta formatos de Soluciones Neto / Zendesk:
+ * - "Hola, 507 - OCOZOCUAUTLA CENTRO" (encuestas / seguimiento)
+ * - "Tienda: 638 - LOS PAJAROS TUXTLA GUTIERREZ"
+ * - "1006 - CAMPO VIEJO" (código y nombre directo)
+ * - "Tienda #1293" / "Sucursal 456"
+ */
+function extraerTienda(asunto, cuerpo) {
+  const texto = `${asunto || ''}\n${cuerpo || ''}`;
+
+  // 1. Patrón común en correos de Soluciones Neto: "Hola, 507 - OCOZOCUAUTLA CENTRO"
+  const mHola = texto.match(/Hola,\s*([0-9]{3,5}\s*-[^\n\r.?¿]+)/i);
+  if (mHola) return mHola[1].trim();
+
+  // 2. Patrón de etiquetas explícitas: Solicitante / Organización / Tienda / Sucursal
+  const mTag = texto.match(/(?:Solicitante|Organización|Tienda|Sucursal)\s*:?\s*([0-9]{3,5}\s*-[^\n\r<]+|[0-9]{3,5}\b[^\n\r<]+)/i);
+  if (mTag) return mTag[1].trim();
+
+  // 3. Patrón directo de código y nombre de tienda (ej. "1006 - CAMPO VIEJO" o "1293 - 15 ORIENTE")
+  const mDirect = texto.match(/\b([0-9]{3,5}\s*-\s*[A-ZÁÉÍÓÚÑ0-9\s]{3,35})\b/);
+  if (mDirect) return mDirect[1].trim();
+
+  // 4. Mención de palabra tienda / sucursal con número: "tienda 1045"
+  const mPalabra = texto.match(/\b(?:tienda|sucursal|tda)\.?\s*#?\s*([0-9]{3,5}(?:\s*-[^\n\r]+)?)/i);
+  if (mPalabra) return `Tienda #${mPalabra[1].trim()}`;
+
+  return 'Centro de Soluciones Neto';
 }
 
 // ============================================================================
@@ -547,9 +591,14 @@ async function procesarIngeniero(ing, esManual = false) {
         // 1. Extracción y saneamiento de datos
         const rawFolio = extraerRegex(asunto + '\n' + cuerpo, /(?:Ticket\s*#?|solicitud\s*\(|#)(\d{4,8})/i, 1, '');
         const folio = rawFolio ? `#${rawFolio}` : 'Ver detalles';
-        const tiendaRaw = extraerRegex(asunto + '\n' + cuerpo, /(?:Solicitante|Organización|Tienda|Sucursal)\s*:?\s*([0-9]{3,5}\s*-[^\n\r<]+|[0-9]{3,5}\b[^\n\r<]+)/i, 1, '')
-          || extraerRegex(asunto, /\b(?:tienda|sucursal|tda)\.?\s*#?\s*([0-9]{3,5}(?:\s*-[^\n\r]+)?)/i, 1, '')
-          || 'Centro de Soluciones Neto';
+
+        // Extraer tienda y verificar si ya teníamos la tienda registrada previamente para este folio
+        const tiendaEncontrada = extraerTienda(asunto, cuerpo);
+        const tiendaPrevia = (rawFolio && Array.isArray(historial))
+          ? historial.find(h => h.folio === folio && h.tienda !== 'Centro de Soluciones Neto')?.tienda
+          : null;
+        const tiendaRaw = (tiendaEncontrada !== 'Centro de Soluciones Neto') ? tiendaEncontrada : (tiendaPrevia || 'Centro de Soluciones Neto');
+
         const prioridadRaw = extraerRegex(cuerpo, /Prioridad\s*:?\s*([A-Za-zÁÉÍÓÚáéíóú]+)/i, 1, 'Normal');
         const hora = formatearHoraLocal(fechaCorreo);
         const fallaLimpia = limpiarAsunto(asunto);
@@ -586,6 +635,9 @@ async function procesarIngeniero(ing, esManual = false) {
         // 3. Despacho de notificación si no está en modo silencio
         if (!pausado) {
           if (esResuelto) {
+            const notaRes = extraerNotaComentario(cuerpo);
+            const seccionNotaRes = notaRes ? `\n\n🔧 <b>Acción realizada:</b>\n<i>${escaparHtml(notaRes)}</i>` : '';
+
             const mensaje = 
 `✅ <b>TICKET RESUELTO / CERRADO</b>
 <code>━━━━━━━━━━━━━━━━━━━━━━</code>
@@ -594,7 +646,7 @@ async function procesarIngeniero(ing, esManual = false) {
 ✔️ <b>Estado:</b> Cerrado en CSN
 🕒 <b>Hora:</b> ${escaparHtml(hora)}
 
-<blockquote>📌 <b>Falla:</b> ${fallaHtml}</blockquote>`;
+<blockquote>📌 <b>Falla:</b> ${fallaHtml}${seccionNotaRes}</blockquote>`;
 
             await enviarTelegram(chatId, mensaje, tecladoAlertaTicket());
             console.log(`[RESUELTO -> ${ing.nombre}] ${folio} | ${tiendaRaw} a las ${hora}`);
